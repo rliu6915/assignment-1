@@ -9,9 +9,11 @@ from assignment.agent.base import (
     DEFAULT_COMPACTION_KEEP_RECENT_STEPS,
     DEFAULT_COMPACTION_MAX_TOKENS,
     Agent,
+    format_tool_output,
 )
 from assignment.agent.tools import EXECUTE_TOOL, SEND_MESSAGE_TOOL
 from assignment.env import Environment
+
 
 class CodeAgent(Agent):
     """An agent that fixes a software issue and submits a git patch."""
@@ -43,21 +45,107 @@ class CodeAgent(Agent):
         self.task = task
         self.submitted_patch = ""
 
-        # TODO(Part 1.3): Make the `execute` and `send_message` tools available
-        # to the agent.
+        self.tools.extend([EXECUTE_TOOL, SEND_MESSAGE_TOOL])
 
-        # TODO(1.1.b): Construct the system prompt and task_prompt. These
-        # should be usable by the `Agent.build_prompt` method.
-        # TODO(1.4): If any skills are available to the agent, make their
-        # descriptions/metadata available to the agent in the prompt.
+        system_information = {
+            "machine": self.env.machine,
+            "release": self.env.release,
+            "system": self.env.system,
+            "version": self.env.version,
+        }
+        self.system_prompt = (
+            "You are a software engineering agent working in a terminal.\n"
+            "Investigate the repository, reproduce the reported issue, make a "
+            "focused fix, and verify it with the project's tests.\n"
+            "Commands run in a non-interactive shell; prefer small outputs.\n"
+            f"<system_information>\n"
+            f"{json.dumps(system_information, indent=2)}\n"
+            f"</system_information>"
+        )
+        if self.skills:
+            catalog = "\n".join(skill["metadata"] for skill in self.skills.values())
+            self.system_prompt += (
+                "\n\nSkills are available. Call `invoke_skill` with a skill's "
+                "name to read its instructions, then follow them.\n"
+                f"<skills>\n{catalog}\n</skills>"
+            )
+
+        self.task_prompt = (
+            "Fix the following issue in the repository at the current working "
+            "directory.\n\n"
+            f"{task}"
+        )
 
     def execute_tool_calls(
         self, tool_calls: list[dict[str, Any]]
     ) -> list[dict[str, str]]:
         """Execute ``execute`` and ``send_message`` calls in the code sandbox."""
 
-        # TODO(Part 1.3): Parse each call, execute recognized tools, and return
-        # one message per call (there may be multiple tool calls in one agent
-        # response!). Malformed JSON and unknown tools must become recoverable
-        # observations relayed to the agent instead of exceptions.
-        raise NotImplementedError
+        observations: list[dict[str, str]] = []
+        for call in tool_calls:
+            call_id = call.get("id", "")
+            function = call.get("function") or {}
+            name = function.get("name", "")
+            raw_arguments = function.get("arguments") or ""
+
+            arguments, error = _parse_arguments(raw_arguments)
+            if error is not None:
+                content = error
+            elif name == "execute":
+                content = self._execute(arguments)
+            elif name == "send_message":
+                content = self._send_message(arguments)
+            elif name == "invoke_skill":
+                content = self._invoke_skill(arguments)
+            else:
+                content = f"Error: unknown tool '{name}'."
+
+            observations.append(
+                {"role": "tool", "tool_call_id": call_id, "content": content}
+            )
+
+        return observations
+
+    def _execute(self, arguments: dict[str, Any]) -> str:
+        command = arguments.get("command")
+        if not isinstance(command, (str, list)):
+            return "Error: execute needs a 'command' string or argv list."
+
+        overrides = {
+            key: arguments[key]
+            for key in ("shell", "cwd", "timeout", "env")
+            if key in arguments
+        }
+        try:
+            result = self.env.execute(command, **overrides)
+        except Exception as exc:
+            return f"Error: execute failed ({type(exc).__name__}: {exc})."
+        return format_tool_output(result)
+
+    def _send_message(self, arguments: dict[str, Any]) -> str:
+        summary = arguments.get("summary")
+        if not isinstance(summary, str):
+            return "Error: send_message needs a 'summary' string."
+        self.finished = True
+        return f"Message delivered: {summary}"
+
+    def _invoke_skill(self, arguments: dict[str, Any]) -> str:
+        name = arguments.get("name")
+        if not isinstance(name, str):
+            return "Error: invoke_skill needs a 'name' string."
+        skill = self.skills.get(name)
+        if skill is None:
+            return f"Error: no skill named '{name}'."
+        return skill["content"]
+
+
+def _parse_arguments(raw: str) -> tuple[dict[str, Any], str | None]:
+    """Parse one tool call's arguments, reporting problems as observations."""
+
+    try:
+        arguments = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}, "Error: tool arguments were not valid JSON."
+    if not isinstance(arguments, dict):
+        return {}, "Error: tool arguments must be a JSON object."
+    return arguments, None
